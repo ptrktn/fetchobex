@@ -1,0 +1,408 @@
+#!/usr/bin/perl
+
+# Project Home: http://code.google.com/p/fetchobex/
+# Non-members may check out a read-only working copy anonymously over HTTP.
+# svn checkout http://fetchobex.googlecode.com/svn/trunk/ fetchobex-read-only 
+
+require 5.8.1;
+
+use strict;
+use XML::Parser;
+use File::Path qw(make_path remove_tree);
+use File::Copy;
+use Digest::MD5 qw(md5_hex);
+use Encode qw(encode decode);
+
+my $me = "fetchobex";
+my $datdir = $ENV{'HOME'} . "/.$me";
+my $datfile = $datdir . "/files.xml";
+my $cfgfile = $datdir . "/config.xml";
+my $dstdir = $ENV{'HOME'} . "/Pictures/$me";
+my $verbose = 0;
+
+my $parser = new XML::Parser(
+	Handlers => {
+		Start   => \&hdl_start,
+		End     => \&hdl_end,
+		Char    => \&hdl_char,
+		Default => \&hdl_def,
+	},	ProtocolEncoding => 'UTF-8',
+	ErrorContext => 3
+	);
+
+my %filedb;
+my %scandb;
+my %cfgdb;
+my %devdb;
+my %drivedb;
+my @filelist = ();
+my @dirlist = ();
+my $fetched = 0;
+
+exit main();
+
+sub preflight {
+	foreach my $cmd (("obexftp", "hcitool")) {
+		die "No command \`$cmd' found" if system("test -x \"`which $cmd`\" > /dev/null 2>&1");
+	}
+	
+	warn "Environment is not using UTF-8" unless $ENV{'LANG'} =~ /\.utf.*8$/i;
+}
+
+sub main {
+	preflight();
+	make_path($datdir);
+	make_path($dstdir);
+	chdir $dstdir || die;
+	readCfg();
+	checkLock();
+	readDb();
+
+	if (0 == scanDevs()) {
+		print "No configured devices found\n";
+	} else {
+		print "Found " . scalar(keys(%scandb)) . " new or updated file(s)\n";
+		fetchDevs();
+		writeDb() if $fetched;
+	}
+
+	removeLock();
+
+	0;
+}
+
+sub doCmd {
+	my $cmd = shift;
+	my $keepgoing = shift || 0;
+	print "Command `$cmd' keegoing `$keepgoing'\n" if $verbose;
+	my @out = `$cmd`;
+	die "ERROR `$cmd'" if $? && not($keepgoing);
+	chomp(@out);
+	1 < scalar(@out) ? @out : $out[0];
+}
+
+sub pipeCmd {
+	my $cmd = shift || die;
+
+	print "Command `$cmd'\n" if $verbose;
+
+	my $ref = eval {
+		open(my $xml, "$cmd |");
+		$parser->parse(*$xml, ErrorContext => 3);
+		close($xml);
+	};
+
+	return $@;
+}
+
+sub driveInfo {
+	my $bdaddr = shift || die;
+	@dirlist = ();
+	my $cmd = "obexftp -b $bdaddr -l 2> /dev/null";
+
+	unless (pipeCmd($cmd)) {
+		my @dirs = @dirlist;
+		$drivedb{$bdaddr} = \@dirs;
+		return 1;
+	}
+	
+	0;
+}
+
+sub driveLabel {
+	my $bdaddr = shift || die;
+	my $drive = uc(substr(shift, 0, 2)) || die;
+
+	foreach my $ref (@{$drivedb{$bdaddr}}) {
+		my %folder = %$ref;
+		if ($drive eq uc($folder{'name'}) &&
+			defined($folder{'label'})) {
+			my $label = $folder{'label'};
+			return $label;
+		}
+	}
+
+	"UNTITLED";
+}
+
+sub searchDevice {
+	my $bdaddr = shift || die;
+	my @res = doCmd("hcitool scan");
+
+	foreach my $line (@res) {
+		$line =~ s/^\s+|\s+$//;
+		$line =~ s/\s+/ /;
+		my @elems = split(/ /, $line);
+		die if 0 == scalar(@elems);
+		next unless lc($bdaddr) eq lc($elems[0]);
+		$devdb{$elems[0]} = (2 == scalar(@elems) ? $elems[1] : $elems[0]);
+		return driveInfo($bdaddr);
+	}
+
+	();
+}
+
+
+sub deviceName {
+	my $bdaddr = shift || die;
+	$devdb{$bdaddr};
+}
+
+
+sub hdl_start{
+	my ($p, $elt, %atts) = @_;
+	
+	if ("folder" eq $elt) {
+		push(@dirlist, \%atts);
+	} elsif ("file" eq $elt) {
+		push(@filelist, \%atts);
+	} elsif ("device" eq $elt) {
+		if (defined($atts{'bdaddr'}) &&
+			defined($atts{'dir'})) {
+			push(@{$cfgdb{uc($atts{'bdaddr'})}}, $atts{'dir'});
+		}
+	}
+}
+
+sub hdl_end{
+	my ($p, $elt) = @_;
+}
+  
+sub hdl_char {
+	my ($p, $str) = @_;
+}
+  
+sub hdl_def { }  
+
+sub fileDigest {
+	my ($bdaddr, $dir, $name) = @_;
+	md5_hex(encode("UTF-8", $bdaddr . lc($dir) . lc($name)));
+}
+
+
+sub readCfg {
+	die "ERROR: config file `$cfgfile' not found" unless -f $cfgfile;	
+	%cfgdb = ();
+	$parser->parsefile($cfgfile, ErrorContext => 3);
+	
+	return unless $verbose;
+
+	foreach my $bdaddr (keys(%cfgdb)) {
+		my @dirs = @{$cfgdb{$bdaddr}};
+		print "Device `$bdaddr', folders " . join(", ", @dirs) . "\n";
+	}
+}
+ 
+sub readDb {
+	%filedb = ();
+	return unless -f $datfile;	
+	@filelist = ();
+	$parser->parsefile($datfile, ErrorContext => 3);
+
+	foreach my $ref (@filelist) {
+		my %file = %$ref;
+		$filedb{$file{'digest'}} = \%file;
+	}
+}
+
+sub writeDb {
+	copy($datfile, $datfile . ".bak") if -f $datfile;
+	open(my $fh, ">", $datfile)
+		or die "cannot open > `$datfile': $!";
+	print $fh "<?xml version=\"1.0\"?>\n"
+		. "<filelist>\n";
+	
+	foreach my $digest (keys(%filedb)) {
+		my %file = %{$filedb{$digest}};
+		print $fh "  <file";
+		foreach my $att (keys(%file)) {
+			next if "name" eq $att or "dir" eq $att or "bdaddr" eq $att;
+			print $fh " " . $att . "=\"" . $file{$att} . "\"";
+		}
+		print $fh "/>\n";
+	}
+	
+	print $fh "</filelist>\n";
+	close($fh);
+}
+
+
+sub scanDir {
+	my $bdaddr = shift || die;
+	my $devdir = shift || die;
+	@filelist = ();
+	@dirlist = ();
+
+	print "Listing `$devdir'\n" if $verbose;
+
+	my $cmd = "obexftp -b $bdaddr -c \"$devdir\" -l 2> /dev/null";
+
+	return if pipeCmd($cmd);
+
+	foreach my $ref (@filelist) {
+		my %file = %$ref;
+		$file{'dir'} = $devdir;
+		$file{'bdaddr'} = $bdaddr;
+		my $digest = fileDigest($bdaddr, $file{'dir'}, $file{'name'});
+		$file{'digest'} = $digest;
+		$scandb{$digest} = \%file if newFile(\%file);
+	}
+
+	my @newdirs = @dirlist;
+	foreach my $ref (@newdirs) {
+		my %file = %$ref;
+		# print "Scan `" . $devdir . "/" . $file{'name'} . "'\n";
+		scanDir($bdaddr, $devdir . "/" . $file{'name'});
+	}
+}
+
+sub scanDevs {
+	my $n = 0;
+	foreach my $bdaddr (keys(%cfgdb)) {
+		die unless 17 == length($bdaddr);
+	    next unless searchDevice($bdaddr);
+		print "Found device `" . deviceName($bdaddr) . "'\n";
+		foreach my $devdir (@{$cfgdb{$bdaddr}}) {
+			scanDir($bdaddr, $devdir);
+		}
+		$n++;
+	}
+
+	$n;
+}
+
+sub newFile {
+	my $ref = shift;
+	my %file = %$ref;
+	my $digest = $file{'digest'};
+
+	return 1 unless defined($filedb{$digest});
+
+	my %fetched = %{$filedb{$digest}};
+
+	$file{'size'} ne $fetched{'size'} ||
+		$file{'modified'} ne $fetched{'modified'} ? 1 : 0;
+}
+
+sub fetchDevs {	
+	foreach my $digest (keys(%scandb)) {
+		my %file = %{$scandb{$digest}};
+		my $cmd = "obexftp -b " . $file{'bdaddr'}
+		. " -c \"" . $file{'dir'} . "\" -g \"" . $file{'name'} 
+		. "\" 2> /dev/null";
+		my $fetch = $file{'dir'} . "/" . $file{'name'};
+		print "Fetching `" . encode("UTF-8", $fetch) . "' from `" 
+			. deviceName($file{'bdaddr'}) . "' - ";
+		doCmd($cmd, 1);
+		if ( -f $file{'name'} ) {
+			$filedb{$file{'digest'}} = \%file;		 
+			my $path = decode("UTF-8", 
+							  $dstdir . "/" 
+							  . deviceName($file{'bdaddr'}) 
+							  . "/" . driveLabel($file{'bdaddr'}, $file{'dir'})
+							  . "/" . substr($file{'dir'}, 3));
+			make_path($path);
+			move($file{'name'}, $path); # FIXME check success
+			$fetched++;
+			print "OK";
+		} else {
+			print "FAILED";
+		}
+		print "\n";
+	}
+}
+
+
+sub getLock {
+	"$datdir/$me.pid"; 
+}
+
+
+sub checkLock {
+	my $f = getLock();
+	if (-f $f) {
+		my $pid = `cat $f`;
+		chomp($pid);
+		print "Lock file found: ";
+		my @out = `ps -ef | grep $pid | grep -v grep`;
+		if (0 == scalar(@out)) {
+			print "PID $pid is not running - clearing the lock file\n";
+			unlink($f);
+		} else {
+			print "PID $pid is running - exiting\n";
+			exit 0;
+		}
+	} 
+
+	die "ERROR: lock file `$f' found" if -f $f;
+	open(my $fh, ">", $f)
+		or die "cannot open > `$f': $!";
+	print $fh $$, "\n";
+	close($fh);
+	die "ERROR: could not create lock file `$f'" unless -f $f;
+}
+
+
+sub removeLock {
+	my $f = getLock();
+	unlink($f);
+	die "ERROR: could not remove lock file `$f'" if -f $f;
+}
+
+
+=pod
+
+=head1 NAME
+
+fetcobex
+
+=head1 DESCRIPTION
+
+A tool for fetching files from OBEX FTP capable devices. The pairing of
+devices need to be completed prior to running this tool.  
+
+=head1 CONFIGURATION
+
+Per-user configuration file is read from the following location at startup.
+
+   ~/.fetchobex/config.xml
+
+Example configuration file:
+
+ <?xml version="1.0"?>
+ <devicelist>
+   <!-- N97 mini -->
+   <device bdaddr="00:26:69:FA:CE:C3" dir="E:/Others/Contacts"/>
+   <device bdaddr="00:26:69:FA:CE:C3" dir="E:/Images/Camera"/>
+   <device bdaddr="00:26:69:FA:CE:C3" dir="E:/Videos/Camera"/>
+   <!-- N82 -->
+   <device bdaddr="00:1D:FD:86:47:3F" dir="E:/Images"/>
+   <device bdaddr="00:1D:FD:86:47:3F" dir="E:/Videos"/>
+ </devicelist>
+
+=head1 DEPENDENCIES
+
+B<BlueZ> Official Linux Bluetooth protocol stack
+L<http://www.bluez.org>.
+B<Obexftp> file transfer utility 
+L<http://dev.zuckschwerdt.org/openobex/wiki/ObexFtp>.
+
+=head1 BUGS
+
+The handling of file names and paths containing other than 
+alphanumeric characters is dubious at best. Most of the testing
+has been done with Nokia phones on a Gnome terminal with
+C<LANG=en_US.utf8>.
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2011 Petteri Kettunen. License  GPLv3+: GNU GPL 
+version 3 or later L<http://gnu.org/licenses/gpl.html>.
+This  is  free  software:  you  are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+=head1 HOME PAGE
+
+L<http://code.google.com/p/fetchobex/>
+
+=cut
