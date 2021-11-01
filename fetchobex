@@ -1,8 +1,6 @@
 #!/usr/bin/perl
 
-# Project Home: http://code.google.com/p/fetchobex/
-# Non-members may check out a read-only working copy anonymously over HTTP.
-# svn checkout http://fetchobex.googlecode.com/svn/trunk/ fetchobex-read-only 
+# Project Home: https://github.com/ptrktn/fetchobex
 
 require 5.8.1;
 
@@ -403,6 +401,6 @@ There is NO WARRANTY, to the extent permitted by law.
 
 =head1 HOME PAGE
 
-L<http://code.google.com/p/fetchobex/>
+L<https://github.com/ptrktn/fetchobex>
 
 =cut
